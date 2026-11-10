@@ -28,9 +28,12 @@ import kotlin.math.roundToInt
  * que informan en qué instante exacto sonó o se captó cada muestra, las dos con el mismo reloj.
  * Con esos dos datos se calcula dónde cae el inicio del beat dentro de la grabación.
  */
-class AudioEngine(private val ctx: Context) {
+class AudioEngine private constructor(private val ctx: Context) {
     companion object {
         const val SR = BeatDecoder.SAMPLE_RATE
+        @Volatile private var instance: AudioEngine? = null
+        fun get(ctx: Context): AudioEngine =
+            instance ?: synchronized(this) { instance ?: AudioEngine(ctx).also { instance = it } }
     }
 
     private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -38,11 +41,13 @@ class AudioEngine(private val ctx: Context) {
     private val beats = HashMap<String, Beat>()
     val takesDir: File = File(ctx.filesDir, "voces").apply { mkdirs() }
 
-    private var player: Player? = null
-    private var playingBeatId: String? = null
-    private var playingFile: String? = null
-    private var recorder: Recorder? = null
-    private var lastSync = "sin datos"
+    // @Volatile: el hilo principal lee estos datos sin esperar a nadie.
+    @Volatile private var player: Player? = null
+    @Volatile private var playingBeatId: String? = null
+    @Volatile private var playingFile: String? = null
+    @Volatile private var recorder: Recorder? = null
+    @Volatile private var lastSync = "sin datos"
+    @Volatile private var lastError: String? = null
 
     // Si se desconectan los auriculares, el beat se pausa solo. La grabación sigue.
     private val noisyReceiver = object : BroadcastReceiver() {
@@ -154,7 +159,9 @@ class AudioEngine(private val ctx: Context) {
             val beat0 = pt.nanoTime - pt.framePosition * 1_000_000_000L / SR
             val rec0 = rt.nanoTime - rt.framePosition * 1_000_000_000L / SR
             val frames = ((beat0 - rec0) * SR / 1_000_000_000L).toInt()
-            return Pair(frames, true)
+            // Un desfase real es de décimas de segundo. Si da más de 2 s, el equipo informó
+            // marcas de tiempo malas: se descartan y se usa el plan B.
+            if (kotlin.math.abs(frames) < 2 * SR) return Pair(frames, true)
         }
         // Plan B: diferencia entre los momentos en que se dio la orden de arrancar.
         val frames = ((p.startNanos - r.startNanos) * SR / 1_000_000_000L).toInt()
@@ -261,7 +268,7 @@ class AudioEngine(private val ctx: Context) {
 
     // ---------------------------------------------------------------- estado
 
-    @Synchronized fun status(): Map<String, Any?> = mapOf(
+    fun status(): Map<String, Any?> = mapOf(
         "playingBeatId" to playingBeatId,
         "playingFile" to playingFile?.takeIf { player?.finished == false },
         "recording" to (recorder != null),
@@ -272,7 +279,12 @@ class AudioEngine(private val ctx: Context) {
         "route" to routeName(),
         "calMs" to calibrationMs(),
         "lastSync" to lastSync,
+        "lastError" to lastError,
         "micSource" to micSourceName(),
+    )
+
+    /** Espacio usado y libre. Toca el disco, así que se pide aparte y de vez en cuando. */
+    fun storage(): Map<String, Any> = mapOf(
         "storageBytes" to (takesDir.listFiles()?.sumOf { it.length() } ?: 0L),
         "freeBytes" to takesDir.usableSpace,
     )
@@ -285,16 +297,27 @@ class AudioEngine(private val ctx: Context) {
         AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
         AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, 26 /* TYPE_BLE_HEADSET */,
     )
-    private fun outputs() = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-    fun hasHeadphones() = outputs().any { it.type in headphoneTypes }
-    private fun routeClass(): String {
-        val o = outputs()
+    private fun computeRouteClass(): String {
+        val o = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         return when {
             o.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == 26 } -> "bt"
             o.any { it.type in headphoneTypes } -> "cable"
             else -> "parlante"
         }
     }
+
+    // La salida se averigua una vez y se actualiza solo cuando Android avisa que cambió
+    // (enchufar o sacar auriculares). Preguntarlo todo el tiempo recarga al sistema.
+    @Volatile private var routeCls: String = computeRouteClass()
+    private val deviceCallback = object : android.media.AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) { routeCls = computeRouteClass() }
+        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) { routeCls = computeRouteClass() }
+    }
+    init {
+        am.registerAudioDeviceCallback(deviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
+    }
+    fun hasHeadphones() = routeCls != "parlante"
+    private fun routeClass(): String = routeCls
     private fun routeName() = when (routeClass()) {
         "bt" -> "Auriculares Bluetooth"
         "cable" -> "Auriculares con cable"
@@ -329,6 +352,7 @@ class AudioEngine(private val ctx: Context) {
         fun start() {
             running = true
             thread = Thread({
+              try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
                 val src = loop ?: oneShot!!
                 var pos = 0
@@ -354,6 +378,10 @@ class AudioEngine(private val ctx: Context) {
                     var guard = 0
                     while (running && track.playbackHeadPosition < endFrames && guard++ < 200) Thread.sleep(10)
                 }
+              } catch (e: Throwable) {
+                // Un fallo de audio nunca debe cerrar la app: se anota y se corta la reproducción.
+                lastError = "Reproducción: $e"
+              }
                 finished = true
             }, "mayus-player").also { it.start() }
         }
@@ -405,6 +433,7 @@ class AudioEngine(private val ctx: Context) {
             check(rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "No se pudo empezar a grabar" }
             running = true
             thread = Thread({
+              try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
                 val buf = ShortArray(2048)
                 var sinceHeader = 0
@@ -423,6 +452,9 @@ class AudioEngine(private val ctx: Context) {
                     sinceHeader += n
                     if (sinceHeader >= SR) { writer.updateHeader(); sinceHeader = 0 }
                 }
+              } catch (e: Throwable) {
+                lastError = "Grabación: $e"
+              }
             }, "mayus-recorder").also { it.start() }
         }
 

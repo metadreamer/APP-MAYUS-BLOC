@@ -29,9 +29,26 @@ Verificado en la computadora de desarrollo:
 **No verificado: nada de lo que necesita un celular real.** El prototipo no se pudo ejecutar acá.
 Que suene, que grabe y que la sincronía sea buena lo decide la prueba de BLOQQ.
 
+## Versión 0.1.1: el cierre de la 0.1.0
+
+La 0.1.0 se cerraba al tocar play, parar o borrar. Las acciones que no devuelven ningún dato
+le pasaban a Flutter un valor que no sabe enviar, y eso tiraba abajo la app. Se reprodujo en un
+emulador de Android 14 y se corrigió. En ese mismo emulador se probó la 0.1.1: abrir, play,
+parar, grabar sobre el beat, parar y exportar la mezcla en MP3, sin cierres.
+
+Además, la 0.1.1:
+
+- Muestra en un cartel rojo el detalle de cualquier cierre o error, con un botón para copiarlo.
+- Muestra el modelo del celular y la versión de la app.
+- Usa un solo motor de audio aunque Android recree la pantalla.
+- Consulta la salida de audio solo cuando cambia, en vez de varias veces por segundo.
+- Dibuja con OpenGL en vez de Vulkan, que da problemas en algunos chips.
+
+El emulador no sirve para juzgar el sonido ni la sincronía: eso sigue dependiendo de la prueba en el celular.
+
 ## Lista de prueba para BLOQQ
 
-Instalar `mayus-bloc-hito1.apk` y anotar qué pasa en cada punto.
+Instalar `mayus-bloc-hito1-v0.1.1.apk` y anotar qué pasa en cada punto.
 
 1. **Arranque.** La app abre y el cartel de arriba dice "Listo."
 2. **Loop.** Tocar play en cada beat y escuchar dos minutos con auriculares. Cada compás empieza con

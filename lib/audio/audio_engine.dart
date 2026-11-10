@@ -63,6 +63,12 @@ abstract class AudioEngine {
   Future<Map> export(String name, String kind, String format,
       {double voiceGain = 1, double beatGain = 0.6, double nudgeMs = 0});
   Future<Map> status();
+  Future<Map> storage();
+
+  /// Detalle del último cierre inesperado, si lo hubo.
+  Future<String?> lastCrash();
+  Future<void> clearCrash();
+  Future<String> deviceInfo();
 }
 
 /// Implementación para Android: habla con el motor en Kotlin (MainActivity.kt).
@@ -121,4 +127,12 @@ class AndroidAudioEngine implements AudioEngine {
       });
   @override
   Future<Map> status() async => await _ch.invokeMethod('status');
+  @override
+  Future<Map> storage() async => await _ch.invokeMethod('storage');
+  @override
+  Future<String?> lastCrash() async => await _ch.invokeMethod('lastCrash');
+  @override
+  Future<void> clearCrash() => _ch.invokeMethod('clearCrash');
+  @override
+  Future<String> deviceInfo() async => await _ch.invokeMethod('deviceInfo');
 }

@@ -25,15 +25,74 @@ import java.util.concurrent.Executors
  * Puente entre la interfaz (Flutter) y el motor de audio (Kotlin).
  * Flutter llama por el canal "mayusbloc/audio"; el trabajo pesado corre en un hilo aparte.
  */
+private val sharedWorker = Executors.newSingleThreadExecutor()
+
 class MainActivity : FlutterActivity() {
     private lateinit var engine: AudioEngine
-    private val worker = Executors.newSingleThreadExecutor()
+    private val worker get() = sharedWorker
     private val main = Handler(Looper.getMainLooper())
     private var pendingPermission: MethodChannel.Result? = null
 
+    private fun crashFile() = File(filesDir, "ultimo_error.txt")
+
+    /**
+     * Junta todo lo que se sabe del último cierre: el error que guardó la app y, en Android 11
+     * o más nuevo, el motivo que anotó el propio sistema (sirve también para cierres del
+     * código nativo o por falta de memoria, que la app no puede atrapar).
+     */
+    private fun lastCrash(): String? {
+        val sb = StringBuilder()
+        crashFile().takeIf { it.exists() }?.let { sb.append(it.readText()).append("\n") }
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            try {
+                val am = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
+                val seen = getPreferences(MODE_PRIVATE).getLong("exitSeen", 0)
+                var newest = seen
+                for (e in am.getHistoricalProcessExitReasons(packageName, 0, 5)) {
+                    if (e.timestamp <= seen) continue
+                    newest = maxOf(newest, e.timestamp)
+                    val bad = e.reason in setOf(
+                        android.app.ApplicationExitInfo.REASON_CRASH,
+                        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE,
+                        android.app.ApplicationExitInfo.REASON_ANR,
+                        android.app.ApplicationExitInfo.REASON_LOW_MEMORY,
+                        android.app.ApplicationExitInfo.REASON_SIGNALED,
+                        android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE,
+                        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE)
+                    if (!bad) continue
+                    sb.append("Sistema: motivo ${e.reason}, estado ${e.status}. ${e.description ?: ""}\n")
+                    try {
+                        e.traceInputStream?.use { s ->
+                            val raw = s.readBytes()
+                            // En cierres nativos el informe es binario: se rescatan los textos legibles.
+                            val text = String(raw, Charsets.ISO_8859_1).replace(Regex("[^\\x20-\\x7E\\n]+"), " ")
+                            sb.append(text.take(1500)).append("\n")
+                        }
+                    } catch (_: Throwable) {}
+                }
+                pendingExitSeen = newest
+            } catch (_: Throwable) {}
+        }
+        return sb.toString().trim().ifEmpty { null }
+    }
+    private var pendingExitSeen = 0L
+
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        // Si la app se cierra por un error, se guarda el detalle para mostrarlo al reabrir.
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                crashFile().writeText("Hilo ${t.name}\n" + android.util.Log.getStackTraceString(e).take(6000))
+            } catch (_: Throwable) {}
+            previous?.uncaughtException(t, e)
+        }
+        super.onCreate(savedInstanceState)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        engine = AudioEngine(applicationContext)
+        // Un solo motor para toda la app: si Android recrea la pantalla, el audio y los beats ya cargados siguen.
+        engine = AudioEngine.get(applicationContext)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mayusbloc/audio")
             .setMethodCallHandler { call, result -> handle(call, result) }
     }
@@ -42,6 +101,14 @@ class MainActivity : FlutterActivity() {
         when (call.method) {
             // Rápidas: se responden en el momento.
             "status" -> result.success(engine.status())
+            "lastCrash" -> result.success(lastCrash())
+            "clearCrash" -> {
+                crashFile().delete()
+                getPreferences(MODE_PRIVATE).edit().putLong("exitSeen", pendingExitSeen).apply()
+                result.success(null)
+            }
+            "deviceInfo" -> result.success(
+                "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE} · ${android.os.Build.HARDWARE}")
             "requestMic" -> requestMic(result)
             "openSettings" -> {
                 startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
@@ -50,8 +117,12 @@ class MainActivity : FlutterActivity() {
             // El resto va al hilo de trabajo.
             else -> worker.execute {
                 try {
-                    val r = heavy(call)
-                    main.post { result.success(r) }
+                    // Las acciones que no devuelven nada dan "Unit" en Kotlin, y Flutter no sabe
+                    // enviar ese valor: hay que cambiarlo por null (este era el cierre de la 0.1.0).
+                    val r = heavy(call).let { if (it is Unit) null else it }
+                    main.post {
+                        try { result.success(r) } catch (e: Throwable) { result.error("audio", e.toString(), null) }
+                    }
                 } catch (e: NotImplementedError) {
                     main.post { result.notImplemented() }
                 } catch (e: Throwable) {
@@ -80,6 +151,7 @@ class MainActivity : FlutterActivity() {
             engine.stopRecording()
         }
         "listTakes" -> engine.listTakes()
+        "storage" -> engine.storage()
         "deleteTake" -> engine.deleteTake(call.argument<String>("name")!!)
         "calibrate" -> engine.calibrate()
         "setRawMic" -> engine.setRawMic(call.argument<Boolean>("raw")!!)
