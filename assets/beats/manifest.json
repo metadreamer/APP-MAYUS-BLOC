@@ -1,0 +1,22 @@
+{
+  "beats": [
+    {
+      "id": "prueba_boombap_92",
+      "name": "Prueba boom bap",
+      "style": "Boom bap",
+      "bpm": 92,
+      "bars": 8,
+      "seconds": 20.87,
+      "file": "prueba_boombap_92.ogg"
+    },
+    {
+      "id": "prueba_trap_140",
+      "name": "Prueba trap",
+      "style": "Trap",
+      "bpm": 140,
+      "bars": 16,
+      "seconds": 27.43,
+      "file": "prueba_trap_140.ogg"
+    }
+  ]
+}
